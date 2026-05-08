@@ -1,0 +1,120 @@
+name: Build, Provision, Deploy to Swarm
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ============ 1. Build & push Docker image ============
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./app
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/swarm-demo:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/swarm-demo:${{ github.sha }}
+
+      # ============ 2. Provision infrastructure ============
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.0
+
+      - name: Terraform Init
+        working-directory: ./terraform
+        run: terraform init
+
+      - name: Terraform Apply
+        working-directory: ./terraform
+        run: |
+          terraform apply -auto-approve \
+            -var "ssh_public_key=${{ secrets.SSH_PUBLIC_KEY }}"
+
+      - name: Capture Terraform outputs
+        id: tf
+        working-directory: ./terraform
+        run: |
+          echo "manager_ip=$(terraform output -raw manager_public_ip)" >> $GITHUB_OUTPUT
+          echo "manager_private_ip=$(terraform output -raw manager_private_ip)" >> $GITHUB_OUTPUT
+          echo "worker_ips=$(terraform output -json worker_public_ips | jq -r 'join(" ")')" >> $GITHUB_OUTPUT
+
+      # ============ 3. Configure Swarm ============
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/swarm_key
+          chmod 600 ~/.ssh/swarm_key
+
+      - name: Wait for instances to finish booting
+        run: |
+          echo "Waiting 90s for user-data (Docker install) to complete..."
+          sleep 90
+
+      - name: Initialize Swarm on manager
+        run: |
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/swarm_key \
+            ec2-user@${{ steps.tf.outputs.manager_ip }} \
+            "sudo docker swarm init --advertise-addr ${{ steps.tf.outputs.manager_private_ip }} || true"
+
+      - name: Get worker join token
+        id: token
+        run: |
+          TOKEN=$(ssh -o StrictHostKeyChecking=no -i ~/.ssh/swarm_key \
+            ec2-user@${{ steps.tf.outputs.manager_ip }} \
+            "sudo docker swarm join-token worker -q")
+          echo "worker_token=$TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Join workers to swarm
+        run: |
+          for ip in ${{ steps.tf.outputs.worker_ips }}; do
+            echo "Joining worker at $ip..."
+            ssh -o StrictHostKeyChecking=no -i ~/.ssh/swarm_key \
+              ec2-user@$ip \
+              "sudo docker swarm join --token ${{ steps.token.outputs.worker_token }} ${{ steps.tf.outputs.manager_private_ip }}:2377 || true"
+          done
+
+      # ============ 4. Deploy stack ============
+      - name: Copy stack.yml to manager
+        run: |
+          scp -o StrictHostKeyChecking=no -i ~/.ssh/swarm_key \
+            stack.yml ec2-user@${{ steps.tf.outputs.manager_ip }}:/home/ec2-user/stack.yml
+
+      - name: Deploy stack
+        run: |
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/swarm_key \
+            ec2-user@${{ steps.tf.outputs.manager_ip }} \
+            "DOCKERHUB_USERNAME=${{ secrets.DOCKERHUB_USERNAME }} sudo -E docker stack deploy -c stack.yml mystack"
+
+      - name: Show cluster status
+        run: |
+          echo "=========================================="
+          echo "🚀 App URL: http://${{ steps.tf.outputs.manager_ip }}/"
+          echo "=========================================="
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/swarm_key \
+            ec2-user@${{ steps.tf.outputs.manager_ip }} \
+            "sudo docker node ls && echo '---' && sudo docker service ls && echo '---' && sudo docker service ps mystack_web"
